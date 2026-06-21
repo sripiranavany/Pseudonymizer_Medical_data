@@ -1,0 +1,26 @@
+# Environment & secrets
+n8n/.env
+n8n/pgpass
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Build outputs
+dist/
+build/
+.angular/
+
+# pgAdmin local data (auto-generated)
+n8n/pgadmin_data/
+
+# OS
+.DS_Store
+Thumbs.db

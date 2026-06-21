@@ -1,0 +1,168 @@
+services:
+
+  # ── Workflow Orchestration ──────────────────────────────────────────
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=admin
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:5678/
+      - GENERIC_TIMEZONE=Europe/Berlin
+      - TZ=Europe/Berlin
+      - NODE_FUNCTION_ALLOW_BUILTIN=*
+      - NODE_FUNCTION_ALLOW_EXTERNAL=*
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ../data:/data
+    depends_on:
+      - ollama
+      - postgres
+      - doc-processor
+    networks:
+      - pseudonymizer_net
+
+  # ── Local LLM (PII Detection + Analysis) ───────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - pseudonymizer_net
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama-init
+    depends_on:
+      - ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sleep 10
+        ollama pull mistral
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    networks:
+      - pseudonymizer_net
+    restart: "no"
+
+  # ── Document Processor (PDF/TXT/DOCX extraction + LangGraph + DB) ──
+  doc-processor:
+    build:
+      context: ../doc-processor
+      dockerfile: Dockerfile
+    container_name: doc-processor
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=pseudonymizer
+      - POSTGRES_USER=pseudo_user
+      - POSTGRES_PASSWORD=pseudo_pass
+    depends_on:
+      - postgres
+      - ollama
+    networks:
+      - pseudonymizer_net
+
+  # ── PostgreSQL (Persistent Storage) ────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=pseudonymizer
+      - POSTGRES_USER=pseudo_user
+      - POSTGRES_PASSWORD=pseudo_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - pseudonymizer_net
+
+  # ── UI: Express API Backend ────────────────────────────────────────
+  ui-backend:
+    build:
+      context: ../ui/backend
+      dockerfile: Dockerfile
+    container_name: ui-backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - N8N_URL=http://n8n:5678
+      - DOC_PROCESSOR_URL=http://doc-processor:8000
+      - PORT=3000
+    depends_on:
+      - n8n
+      - doc-processor
+    networks:
+      - pseudonymizer_net
+
+  # ── UI: Angular Frontend ────────────────────────────────────────────
+  ui-frontend:
+    build:
+      context: ../ui/frontend
+      dockerfile: Dockerfile
+    container_name: ui-frontend
+    restart: unless-stopped
+    ports:
+      - "4200:4200"
+    depends_on:
+      - ui-backend
+    networks:
+      - pseudonymizer_net
+
+  # ── pgAdmin (PostgreSQL GUI) ────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    restart: unless-stopped
+    ports:
+      - "5050:80"
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@local.dev
+      - PGADMIN_DEFAULT_PASSWORD=admin
+      - PGADMIN_CONFIG_SERVER_MODE=False
+      - PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED=False
+      - PGADMIN_SERVER_JSON_FILE=/pgadmin4/servers.json
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin_servers.json:/pgadmin4/servers.json:ro
+      - ./pgpass:/tmp/pgpass:ro
+    depends_on:
+      - postgres
+    networks:
+      - pseudonymizer_net
+
+volumes:
+  n8n_data:
+    driver: local
+  ollama_data:
+    driver: local
+  postgres_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+networks:
+  pseudonymizer_net:
+    driver: bridge

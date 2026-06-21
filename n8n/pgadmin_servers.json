@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "AI Pseudonymizer DB",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "pseudonymizer",
+      "Username": "pseudo_user",
+      "PassFile": "/tmp/pgpass",
+      "SSLMode": "prefer"
+    }
+  }
+}

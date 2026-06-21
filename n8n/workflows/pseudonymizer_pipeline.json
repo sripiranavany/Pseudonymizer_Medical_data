@@ -1,0 +1,222 @@
+{
+  "name": "AI Pseudonymizer - Medical Data Pipeline (LangGraph)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "pseudonymize",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "4f5ab8bb-9e6d-468a-ab72-1064a35bc8c2",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "medical-pseudonymizer-v1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\n\nconst documentText = body.document_text || '';\nconst promptType = body.prompt_type || 'clinical_summary';\nconst documentId = body.document_id || 'doc_' + Date.now();\nconst customPrompt = body.custom_prompt || null;\nconst groundTruth = body.ground_truth_pii || null;\n\nif (!documentText.trim()) {\n  throw new Error('document_text is required and must not be empty');\n}\n\n// Normalize line endings using split/join (avoids CR characters in regex literals)\nconst normalizedText = documentText\n  .split('\\r\\n').join('\\n')\n  .split('\\r').join('\\n')\n  .trim();\n\n// PII appears in the first part of medical documents (header section).\n// Limit to 3000 chars so Ollama responds fast and does not time out.\nconst piiSection = normalizedText.slice(0, 3000);\n\n// Build Ollama request body here in a Code node to safely handle special chars.\nconst ollamaBody = JSON.stringify({\n  model: 'mistral',\n  stream: false,\n  options: { num_predict: 512, temperature: 0 },\n  messages: [\n    {\n      role: 'system',\n      content: 'You are a PII extraction specialist. Return ONLY a valid JSON array. No explanation, no markdown, just the array.'\n    },\n    {\n      role: 'user',\n      content: 'Extract all PII from the text below. Return ONLY a JSON array like:\\n[{\"entity\":\"Hans Mueller\",\"type\":\"NAME\"},{\"entity\":\"14.03.1958\",\"type\":\"DATE\"}]\\n\\nTypes: NAME (patient and physician names), ADDRESS, DATE (all dates), ID_NUMBER (insurance/patient IDs).\\n\\nText:\\n' + piiSection\n    }\n  ]\n});\n\n// Pre-build document store payload for 0b. Save Document node\nconst filename = body.filename || body.document_id || documentId;\nconst fileType = body.file_type || 'text';\n\nconst dbDocumentBody = JSON.stringify({\n  document_id: documentId,\n  filename: filename,\n  file_type: fileType,\n  raw_text: normalizedText,\n  prompt_type: promptType,\n  char_count: normalizedText.length\n});\n\n\n// Pre-build LangGraph request body\nconst langraphBody = JSON.stringify({\n  document_id: documentId,\n  document_text: normalizedText,\n  prompt_type: promptType,\n  pii_section: piiSection,\n  custom_prompt: customPrompt,\n  ground_truth: groundTruth\n});\n\nreturn [{\n  json: {\n    text: normalizedText,\n    pii_section: piiSection,\n    ollama_body: ollamaBody,\n    db_document_body: dbDocumentBody,\n    prompt_type: promptType,\n    document_id: documentId,\n    custom_prompt: customPrompt,\n    ground_truth: groundTruth,\n    char_count: normalizedText.length,\n    langgraph_body: langraphBody\n  }\n}];\n"
+      },
+      "id": "8dce2c8e-5e43-4a9d-8c4a-360ba48950b8",
+      "name": "1. Normalize Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\n\nconst mappingSize = input.mapping_size\n  || (input.mapping ? Object.keys(input.mapping).length : 0);\n\nconst response = {\n  document_id: input.document_id,\n  prompt_type: input.prompt_type,\n  status: 'success',\n  result: {\n    analysis: input.restored_analysis,\n    pii_entities_detected: mappingSize\n  },\n  evaluation: input.evaluation,\n  privacy: {\n    pii_sent_to_external_llm: false,\n    pseudonyms_used: mappingSize,\n    mapping_cleared_after_session: true\n  }\n};\n\nreturn [{ json: response }];\n"
+      },
+      "id": "6347f29e-3e7d-46dc-aa43-3bd46d8970e4",
+      "name": "9. Format Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1984,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "ecbd7193-ba55-400e-a754-bba3f3de657e",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2208,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://doc-processor:8000/db/documents",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.db_document_body }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "node-save-doc-inline",
+      "name": "0b. Save Document",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        320,
+        460
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://doc-processor:8000/db/results",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.db_result_body }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "node-store-result",
+      "name": "7b. Store Result in PostgreSQL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1640,
+        460
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://doc-processor:8000/db/evaluations",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.db_eval_body }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "node-store-eval",
+      "name": "8b. Store Evaluation in PostgreSQL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1860,
+        460
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://doc-processor:8000/langgraph/analyze",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.langgraph_body }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "node-langgraph",
+      "name": "2. LangGraph Pipeline",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        660,
+        300
+      ],
+      "onError": "stopWorkflow"
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "1. Normalize Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Normalize Text": {
+      "main": [
+        [
+          {
+            "node": "2. LangGraph Pipeline",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "0b. Save Document",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "9. Format Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. LangGraph Pipeline": {
+      "main": [
+        [
+          {
+            "node": "9. Format Response",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "7b. Store Result in PostgreSQL",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "8b. Store Evaluation in PostgreSQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {}
+}
