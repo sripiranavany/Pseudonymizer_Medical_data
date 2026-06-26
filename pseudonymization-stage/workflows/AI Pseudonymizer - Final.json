@@ -1,0 +1,417 @@
+{
+  "name": "AI Pseudonymizer - Test",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "bc832113-5c27-4d8c-8d06-dad5789fe58f",
+      "name": "Start",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst path = require('path');\n\n// ← Change this if your path is different\n// const DIR = '/data/grascco_pii_2_json';\nconst DIR = '/home/node/.n8n-files/grascco_pii_2_json';\n\n\nlet files = fs.readdirSync(DIR).filter(f => f.endsWith('.json'));\nif (files.length === 0) throw new Error('No .json files found at: ' + DIR);\nfiles = files.slice(0, 1);\nconst results = [];\n\nfor (const fileName of files) {\n  let cas;\n  try {\n    let raw = fs.readFileSync(path.join(DIR, fileName), 'utf-8');\n    if (raw.charCodeAt(0) === 0xFEFF) {\n        raw = raw.slice(1);\n    }\n    cas = JSON.parse(raw);\n  } catch (e) {\n    continue;\n  }\n\n  const features = cas['%FEATURE_STRUCTURES'];\n  if (!features) continue;\n\n  const sofa = features.find(f => f['%TYPE'] === 'uima.cas.Sofa');\n  const text = sofa?.sofaString || '';\n  if (!text) continue;\n\n  const meta = features.find(f =>\n    f['%TYPE'] === 'de.tudarmstadt.ukp.dkpro.core.api.metadata.type.DocumentMetaData'\n  );\n  const doc_id = meta?.documentTitle || fileName;\n\n  const phiAnnotations = features.filter(f => f['%TYPE'] === 'webanno.custom.PHI');\n  const ground_truth = {\n    doc_id,\n    pii: phiAnnotations\n      .map(a => ({ type: a.kind, value: text.substring(a.begin, a.end) }))\n      .filter(a => a.value.trim() !== '')\n  };\n\n  results.push({ json: { text, language: 'de', doc_id, ground_truth } });\n}\n\nreturn results;"
+      },
+      "id": "8b520df9-5d0b-4642-bff1-6d15e333057c",
+      "name": "Load Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// NODO A VITAMINADO: Detección Mejorada mediante Regex (Optimizado para Alemán)\nconst data = $input.first().json;\nconst text = data.text || \"\";\nconst found = [];\nconst push = (type, value) => {\n  value = (value || \"\").trim().replace(/\\s{2,}[\\s\\S]*$/, \"\");\n  if (value && !found.some(e => e.type === type && e.value === value)) {\n    found.push({ type, value });\n  }\n};\n\n// 1. FECHAS\nconst dateRegex = /\\b\\d{1,2}\\.\\d{1,2}\\.(?:\\d{4})?\\b/g;\n(text.match(dateRegex) || []).forEach(v => push(\"DATE\", v));\n\nconst yearRegex = /\\b(19|20)\\d{2}\\b/g;\n(text.match(yearRegex) || []).forEach(v => {\n  if (!text.match(new RegExp('\\\\d{1,2}\\\\.\\\\d{1,2}\\\\.' + v))) {\n    push(\"DATE\", v);\n  }\n});\n\n// 2. EMAILS Y TELÉFONOS\n(text.match(/\\b[\\w.+-]+@[\\w-]+\\.[\\w.-]+\\b/g) || []).forEach(v => push(\"EMAIL\", v));\n\n// --- FIX: descartar fechas/timestamps que el regex confunde con teléfonos ---\n(text.match(/(?<![A-Za-z0-9+])\\+?\\d[\\d()\\/ .-]{7,}\\d/g) || []).forEach(v => {\n  const val = v.trim();\n  // Si empieza como una fecha dd.dd.dddd, NO es un teléfono (ej. \"24.12.2027 17\")\n  if (/^\\d{1,2}\\.\\d{1,2}\\.\\d{2,4}/.test(val)) return;\n  const digits = val.replace(/\\D/g, \"\");\n  if (digits.length >= 9 && digits.length <= 15) push(\"PHONE\", val);\n});\n\n// 3. EDAD\nconst ageRegex = /\\b(\\d{1,3})(?=-jährigen|-jährige|-jähriger| Jahre alt)\\b/gi;\nlet ageMatch; while ((ageMatch = ageRegex.exec(text)) !== null) push(\"AGE\", ageMatch[1]);\n\n// 4. PROFESIONES\nconst profRegex = /\\b(?:ist|arbeitet als)\\s+([A-Z][a-zßäöü]+in|[A-Z][a-zßäöü]+)\\b/g;\nlet profMatch; while ((profMatch = profRegex.exec(text)) !== null) {\n  const forbidden = [\"Patientin\", \"Frau\", \"Herr\"];\n  if (!forbidden.includes(profMatch[1])) push(\"PROFESSION\", profMatch[1]);\n}\n\n// 5. NOMBRES\nconst forbidden = [\"Patientin\", \"Patient\", \"Frau\", \"Herr\", \"Kollegin\", \"Kollege\"]; // FIX: añadidos Kollegin/Kollege\nconst genericNameRegex = /(?:Patient(?:in)?|Frau|Herr)\\s+([A-Z][a-zßäöü]*\\.?\\s*[A-Z][a-zßäöü]+|[A-Z][a-zßäöü]+)/g;\nlet nm; while ((nm = genericNameRegex.exec(text)) !== null) {\n  const cand = nm[1].trim();\n  if (!forbidden.includes(cand)) push(\"NAME\", cand);   // FIX: filtro aplicado aquí\n}\n\nconst doctorRegex = /([A-Z][a-zßäöü]+\\s+[A-Z][a-zßäöü]+)\\n(?:Stationsarzt|Arzt|Chefartz)/gi;\nlet dm; while ((dm = doctorRegex.exec(text)) !== null) push(\"NAME\", dm[1].trim());\n\nreturn [{ json: { ...data, entities: [...(data.entities || []), ...found] } }];"
+      },
+      "id": "ac4aa9f0-f78f-4f6d-bbfc-363eaacd4efc",
+      "name": "A - Detect (regex)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        432,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// NODO MERGE (Option 1): re-adjunta el documento original + une regex + LLM\n// El item de entrada es la salida del LLM (solo trae el output del modelo).\nconst llmItem = $input.first().json;\n\n// --- Recuperar el documento original (text + ground_truth + doc_id + entities de regex) ---\n// >>> CAMBIA 'Regex' por el nombre EXACTO de tu nodo de regex en el canvas <\n// const orig = $('Regex').first().json;\nconst orig = $('A - Detect (regex)').first().json;\n\nconst regexEntities = orig.entities || [];\n\n// --- Parsear salida del LLM (puede venir como string JSON o ya parseada) ---\nlet llmRaw = llmItem.output ?? llmItem.llm ?? llmItem.new_entities ?? llmItem.entities ?? [];\nif (typeof llmRaw === \"string\") {\n  try { llmRaw = JSON.parse(llmRaw.replace(/```json|```/g, \"\").trim()); }\n  catch { llmRaw = []; }\n}\nconst llmEntities = Array.isArray(llmRaw)\n  ? llmRaw\n  : (llmRaw.entities || llmRaw.new_entities || []);\n\n// --- Separador de títulos: \"Prof. Dr. Norbert Breuer\" -> título + nombre ---\nconst TITLE_RE = /(Priv\\.-Doz\\.\\s*Dr\\.\\s*med\\.|Priv\\.-Doz\\.|Prof\\.\\s*Dr\\.|Prof\\.|Drs\\.|Dr\\.\\s*med\\.|Dr\\.med\\.|Dr\\.)/g;\n\nfunction splitTitleName(type, value) {\n  const out = [];\n  const v = (value || \"\").trim();\n  if (!v) return out;\n\n  const isName = /NAME/i.test(type) || type === \"NAME\";\n  if (isName) {\n    const titles = [];\n    const name = v.replace(TITLE_RE, (m) => { titles.push(m.replace(/\\s+/g, \" \").trim()); return \" \"; })\n                  .replace(/\\s+/g, \" \").trim();\n    for (const t of titles) out.push({ type: \"NAME_TITLE\", value: t });\n    if (name) out.push({ type, value: name });\n    if (!name && titles.length === 0) out.push({ type, value: v });\n    return out;\n  }\n  out.push({ type, value: v });\n  return out;\n}\n\n// --- Limpieza de valores (ej. \"* 4.4.1993\" -> \"4.4.1993\") ---\nconst cleanValue = (v) => (v || \"\").trim().replace(/^[*\\s•\\-]+/, \"\").replace(/\\s+/g, \" \").trim();\n\n// --- Construir lista combinada (regex + LLM), aplicando split de títulos ---\nconst combined = [];\nfor (const e of [...regexEntities, ...llmEntities]) {\n  if (!e || !e.value) continue;\n  const cleaned = cleanValue(e.value);\n  for (const split of splitTitleName(e.type || \"NAME\", cleaned)) {\n    combined.push(split);\n  }\n}\n\n// --- Guard anti-alucinación: descartar fechas cuyos dígitos no estén en el texto ---\nconst sourceDigits = (orig.text || \"\").replace(/\\D/g, \"\");\nconst filtered = combined.filter(e => {\n  if (/DATE/i.test(e.type)) {\n    const d = (e.value || \"\").replace(/\\D/g, \"\");\n    if (d.length >= 4 && !sourceDigits.includes(d)) return false;\n  }\n  return true;\n});\n\n// --- Deduplicar por (familia de tipo, valor normalizado) ---\nconst typeFamily = (t) => {\n  t = (t || \"\").toUpperCase();\n  if (t.includes(\"NAME\") || t.includes(\"TITLE\")) return \"NAME\";\n  if (t.includes(\"DATE\") || t.includes(\"BIRTH\")) return \"DATE\";\n  if (t.includes(\"EMAIL\")) return \"EMAIL\";\n  if (t.includes(\"PHONE\") || t.includes(\"CONTACT\")) return \"PHONE\";\n  return t;\n};\nconst norm = (s) => (s || \"\").trim().toLowerCase().replace(/\\s+/g, \" \");\n\nconst seen = new Set();\nconst merged = [];\nfor (const e of filtered) {\n  const key = typeFamily(e.type) + \"::\" + norm(e.value);\n  if (seen.has(key)) continue;\n  seen.add(key);\n  merged.push({ type: e.type, value: e.value });\n}\n\n// --- Devolver el documento original COMPLETO con las entidades fusionadas ---\nreturn [{ json: {\n  ...orig,            // text, ground_truth, doc_id, language, etc.\n  entities: merged    // sobrescribe con la lista fusionada\n}}];"
+      },
+      "id": "89b4fd92-cfba-4ef6-b652-db4e41c4ff03",
+      "name": "Merge Detections",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        928,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst text = data.text || \"\";\nconst lang = (data.language || \"de\").slice(0, 2);\nconst entities = data.entities || [];\nconst POOLS = {\n  de: { first:[\"Erik\",\"Lena\",\"Jonas\",\"Mara\",\"Felix\",\"Nina\"], last:[\"Bauer\",\"Schwarz\",\"Hoffmann\",\"Kraus\",\"Vogt\",\"Lang\"],\n        street:[\"Gartenweg\",\"Lindenstrasse\",\"Birkenallee\",\"Ulmenweg\"], city:[\"Lindau\",\"Kempten\",\"Memmingen\",\"Bergstadt\"] },\n  fr: { first:[\"Lucas\",\"Emma\",\"Hugo\",\"Lea\",\"Nathan\",\"Chloe\"], last:[\"Martin\",\"Petit\",\"Roche\",\"Garnier\",\"Blanc\",\"Noel\"],\n        street:[\"rue des Lilas\",\"avenue Verte\",\"rue Haute\",\"allee des Pins\"], city:[\"Valbonne\",\"Beaulieu\",\"Montfleur\",\"Rivedoux\"] },\n  es: { first:[\"Marcos\",\"Lucia\",\"Ivan\",\"Nerea\",\"Diego\",\"Carla\"], last:[\"Soler\",\"Vidal\",\"Bravo\",\"Ortega\",\"Ferrer\",\"Pardo\"],\n        street:[\"calle del Olmo\",\"avenida Azul\",\"calle Mayor\",\"plaza Verde\"], city:[\"Vallclara\",\"San Roque\",\"Riofrio\",\"Costaverde\"] }\n};\nconst pool = POOLS[lang] || POOLS.de;\nconst rng = n => Math.floor(Math.random() * n);\nconst pick = a => a[rng(a.length)];\nconst mapping = {};\nconst shiftDate = v => {\n  let d, fmt;\n  let m = v.match(/^(\\d{1,2})\\.(\\d{1,2})\\.(\\d{4})$/);\n  if (m) { d = new Date(+m[3], +m[2] - 1, +m[1]); fmt = \"dmy.\"; }\n  if (!d) {\n  const partial = v.match(/^(\\d{1,2})\\.(\\d{1,2})\\.$/);\n    if (partial) {\n      const day = ((parseInt(partial[1]) - 1 + rng(25) + 1) % 28) + 1;\n      const mon = ((parseInt(partial[2]) - 1 + rng(10) + 1) % 12) + 1;\n      return `${String(day).padStart(2,'0')}.${String(mon).padStart(2,'0')}.`;\n    }\n  }\n  if (!d) { m = v.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/); if (m) { d = new Date(+m[1], +m[2] - 1, +m[3]); fmt = \"ymd-\"; } }\n  if (!d) { m = v.match(/^(\\d{2})\\/(\\d{2})\\/(\\d{4})$/); if (m) { d = new Date(+m[3], +m[2] - 1, +m[1]); fmt = \"dmy/\"; } }\n  if (!d || isNaN(d)) return v;\n  const offset = (rng(90) + 1) * (rng(2) === 0 ? 1 : -1);\n  d.setDate(d.getDate() + offset);\n  const dd = String(d.getDate()).padStart(2, \"0\");\n  const mm = String(d.getMonth() + 1).padStart(2, \"0\");\n  const yyyy = d.getFullYear();\n  if (fmt === \"dmy.\") return `${dd}.${mm}.${yyyy}`;\n  if (fmt === \"ymd-\") return `${yyyy}-${mm}-${dd}`;\n  if (fmt === \"dmy/\") return `${dd}/${mm}/${yyyy}`;\n  return v;\n};\n\nconst fakeFor = (type, value) => {\n  if (mapping[value]) return mapping[value];\n  let fake;\n  if (type === \"NAME\") fake = pick(pool.first) + \" \" + pick(pool.last);\n  else if (type === \"ADDRESS\") fake = pick(pool.street) + \" \" + (1 + rng(120)) + \", \" + (10000 + rng(89999)) + \" \" + pick(pool.city);\n  else if (type === \"DATE\") fake = shiftDate(value);\n  else if (type === \"EMAIL\") fake = pick(pool.first).toLowerCase() + (10 + rng(89)) + \"@example.org\";\n  else fake = value.replace(/\\d/g, () => String(rng(10)));\n  mapping[value] = fake; return fake;\n};\nentities.forEach(e => fakeFor(e.type, e.value));\nlet out = text;\nObject.keys(mapping).sort((a, b) => b.length - a.length).forEach(real => { out = out.split(real).join(mapping[real]); });\nreturn [{ json: { original_text: text, pseudonymized_text: out, mapping, entities, language: lang } }];"
+      },
+      "id": "a22bfb82-7480-4435-b50c-abe755bb427a",
+      "name": "B - Pseudonymize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1152,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const resp = $input.first().json;\nconst mapping = $('B - Pseudonymize').first().json.mapping || {};\nconst analysis = resp.output ?? resp.text ?? (resp.message && resp.message.content) ?? \"\";\nlet out = analysis;\nconst inv = {}; Object.entries(mapping).forEach(([r, f]) => inv[f] = r);\nObject.keys(inv).sort((a, b) => b.length - a.length).forEach(f => { out = out.split(f).join(inv[f]); });\nreturn [{ json: { analysis_text: analysis, restored_text: out, mapping } }];"
+      },
+      "id": "529e480f-2327-44a9-b033-714f461eb5cd",
+      "name": "C - De-pseudonymize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const gt = $('Load Input').first().json.ground_truth || {};\nconst gtList = (gt.pii || []).map(e => e.value);\nconst entities = ($('B - Pseudonymize').first().json.entities || []).map(e => e.value);\nconst mapping = $('B - Pseudonymize').first().json.mapping || {};\nconst restored = $input.first().json.restored_text || \"\";\nconst uniq = a => [...new Set(a)];\nconst has = (set, x) => set.includes(x);\nconst gtS = uniq(gtList), det = uniq(entities);\nconst dTP = det.filter(v => has(gtS, v)).length;\nconst dFP = det.filter(v => !has(gtS, v)).length;\nconst dFN = gtS.filter(v => !has(det, v)).length;\nlet rTP = 0, rFN = 0, rFP = 0;\nObject.entries(mapping).forEach(([real, fake]) => {\n  if (restored.includes(real)) rTP++; else rFN++;\n  if (restored.includes(fake)) rFP++;\n});\nconst ratio = (a, b) => (a + b === 0 ? null : +(a / (a + b)).toFixed(3));\nconst f1 = (p, r) => (p == null || r == null || p + r === 0 ? null : +(2 * p * r / (p + r)).toFixed(3));\nconst dP = ratio(dTP, dFP), dR = ratio(dTP, dFN), rP = ratio(rTP, rFP), rR = ratio(rTP, rFN);\nreturn [{ json: {\n  doc_id: gt.doc_id || null,\n  detection: { tp: dTP, fp: dFP, fn: dFN, precision: dP, recall: dR, f1: f1(dP, dR), missed: gtS.filter(v => !has(det, v)) },\n  restoration: { tp: rTP, fp: rFP, fn: rFN, precision: rP, recall: rR, f1: f1(rP, rR) },\n  restored_text: restored\n} }];"
+      },
+      "id": "efc8d1e7-ec8a-413a-944e-8af5badea04b",
+      "name": "D - Evaluate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1840,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Extract all PII entities from the following German medical document.\n\nDocument:\n{{ $json.text }}\n\nReturn ONLY the JSON object with all entities you find.",
+        "options": {
+          "systemMessage": "You are a PII extraction engine for German medical documents.\nYour ONLY task is to extract every PII entity from the document.\n\nAllowed entity types:\n- NAME_PATIENT   (the patient the report is about — referred to with \"über ... Patientin/Patient\", or the person whose treatment is described)\n- NAME_DOCTOR    (any physician: signs at the end, or appears as \"Frau Dr. X\" / \"Herr Dr. X\")\n- NAME_TITLE     (academic/professional titles: \"Dr.\", \"Dr.med.\", \"Prof.\", \"Prof. Dr.\" — extracted SEPARATELY from the name)\n- DATE_BIRTH     (date of birth: follows \"*\" or \"geb.\" — e.g. \"* 4.4.1997\")\n- DATE           (any other date, including partial dates like \"19.3.\" and standalone years like \"2007\")\n- ADDRESS\n- PHONE\n- EMAIL\n- ID_NUMBER\n\nRules:\n- Read the ENTIRE document carefully and extract ALL matching entities.\n- Extract EVERY occurrence of a name separately, even if the same name repeats (e.g. \"Albers\" appearing 10 times = 10 entities).\n- Split titles from names: \"Dr.med. Bernwart Schulze\" → one NAME_TITLE \"Dr.med.\" AND one NAME_DOCTOR \"Bernwart Schulze\". Never merge them.\n- The full first mention of the patient (e.g. \"Beate Albers\") and later surname-only mentions (e.g. \"Albers\") are each separate entities.\n- Copy every value EXACTLY as it appears: preserve capitalization, punctuation, spaces, and partial formatting (e.g. \"19.3.\" keeps the trailing dot; \"4.4.1997\" has no leading zeros).\n- Do NOT normalize, reformat, translate, or correct any value.\n- NEVER explain your reasoning. NEVER summarize. NEVER answer in natural language.\n- NEVER output Markdown or code fences.\n- Output MUST be valid JSON matching EXACTLY this schema:\n\n{\n  \"entities\": [\n    { \"type\": \"NAME_PATIENT\", \"value\": \"...\" }\n  ]\n}\n\nOutput nothing before or after the JSON. If no entities exist, return {\"entities\":[]}."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        624,
+        0
+      ],
+      "id": "fc13198f-51b7-4e86-9450-205382b6300f",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.pseudonymized_text }}",
+        "options": {
+          "systemMessage": "You are an expert clinical documentation assistant. Your task is to write a concise, professional medical summary (Epikrise/Verlaufsbericht) of the provided clinical note.\n\nCRITICAL PROCESSING LAWS:\n1. VALUE PRESERVATION: Copy EVERY name, date, and age VERBATIM from the source. Never paraphrase or drop specific values.\n2. NO HALLUCINATION: Do not add any medical facts, diagnoses, symptoms, or history that are not explicitly stated in the source text.\n3. MEDICAL RESTRUCTURING: You may improve sentence flow, but only using facts present in the source.\n4. LANGUAGE: German, professional Fachsprache.\n5. FORMAT: Concise structured bullet points."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1328,
+        0
+      ],
+      "id": "84cf073f-5309-432b-9f21-ab26f40471e6",
+      "name": "AI Agent1"
+    },
+    {
+      "parameters": {
+        "model": "mistral-vibe-cli-latest",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatMistralCloud",
+      "typeVersion": 1,
+      "position": [
+        1328,
+        272
+      ],
+      "id": "7fd64b95-27bc-4691-b20f-2654d362bf3c",
+      "name": "Mistral Cloud Chat Model",
+      "credentials": {
+        "mistralCloudApi": {
+          "id": "ecvxW25mR5n9w07J",
+          "name": "Mistral Cloud account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "mistral:latest",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        624,
+        256
+      ],
+      "id": "489ab698-1195-453d-8bac-9dff332e86c1",
+      "name": "Ollama Chat Model1",
+      "credentials": {
+        "ollamaApi": {
+          "id": "aXg2koFTapup88m2",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "let text = $json.restored_text;\n\n// Bold\ntext = text.replace(/\\*\\*(.*?)\\*\\*/g, \"<strong>$1</strong>\");\n\n// Convert bullet points\ntext = text.replace(/^- (.*)$/gm, \"<li>$1</li>\");\n\n// Wrap consecutive <li> items in <ul>\ntext = text.replace(/(<li>.*?<\\/li>\\n?)+/gs, match => `<ul>${match}</ul>`);\n\n// Line breaks\ntext = text.replace(/\\n/g, \"<br>\");\n\nconst html = `\n<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<style>\nbody{\n    font-family: Arial, sans-serif;\n    margin:40px;\n    line-height:1.5;\n}\nul{\n    margin-left:20px;\n}\n</style>\n</head>\n<body>\n${text}\n</body>\n</html>\n`;\n\nreturn [{\n    json: {\n        html\n    },\n  binary: {\n    index_html: {\n      data: Buffer.from(html, 'utf8').toString('base64'),\n      mimeType: 'text/html',\n      fileName: 'index.html'\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2048,
+        0
+      ],
+      "id": "420b749b-6a49-45ac-9005-ce9139625eb4",
+      "name": "Convert to HTML"
+    },
+    {
+      "parameters": {
+        "jsCode": "// NODO DE EVALUACIÓN (post-merge): Precision / Recall / F1\nconst items = $input.all();\n\nconst typeFamily = (t) => {\n  t = (t || \"\").toUpperCase();\n  if (t.includes(\"NAME\") || t.includes(\"TITLE\")) return \"NAME\";\n  if (t.includes(\"DATE\") || t.includes(\"BIRTH\")) return \"DATE\";\n  if (t.includes(\"EMAIL\")) return \"EMAIL\";\n  if (t.includes(\"PHONE\")) return \"PHONE\";\n  if (t.includes(\"AGE\")) return \"AGE\";\n  if (t.includes(\"PROFESSION\")) return \"PROFESSION\";\n  return t;\n};\nconst norm = (s) => (s || \"\").trim().toLowerCase().replace(/\\s+/g, \" \");\nconst valueMatch = (a, b) => {\n  a = norm(a); b = norm(b);\n  if (!a || !b) return false;\n  if (a === b) return true;\n  if (a.length >= 3 && b.length >= 3 && (a.includes(b) || b.includes(a))) return true;\n  return false;\n};\n\nlet totalTP = 0, totalFP = 0, totalFN = 0;\nconst perDoc = [];\n\nfor (const item of items) {\n  const data = item.json;\n  const detected = data.entities || [];\n\n  // --- OPTION A: dedupe ground truth by family + normalized value ---\n  const seenTruth = new Set();\n  const truth = ((data.ground_truth && data.ground_truth.pii) || []).filter(t => {\n    const k = typeFamily(t.type) + \"::\" + norm(t.value);\n    if (seenTruth.has(k)) return false;\n    seenTruth.add(k);\n    return true;\n  });\n  // -----------------------------------------------------------------\n\n  const truthUsed = new Array(truth.length).fill(false);\n  let tp = 0;\n  const tpList = [], fpList = [];\n\n  for (const det of detected) {\n    const dFam = typeFamily(det.type);\n    let matchedIdx = -1;\n    for (let i = 0; i < truth.length; i++) {\n      if (truthUsed[i]) continue;\n      if (typeFamily(truth[i].type) === dFam && valueMatch(det.value, truth[i].value)) {\n        matchedIdx = i; break;\n      }\n    }\n    if (matchedIdx >= 0) {\n      truthUsed[matchedIdx] = true; tp++;\n      tpList.push({ detected: det.value, matched: truth[matchedIdx].value, type: dFam });\n    } else {\n      fpList.push({ value: det.value, type: det.type });\n    }\n  }\n\n  const fnList = [];\n  for (let i = 0; i < truth.length; i++)\n    if (!truthUsed[i]) fnList.push({ value: truth[i].value, type: truth[i].type });\n\n  const fp = fpList.length, fn = fnList.length;\n  const precision = (tp + fp) === 0 ? 0 : tp / (tp + fp);\n  const recall = (tp + fn) === 0 ? 0 : tp / (tp + fn);\n  const f1 = (precision + recall) === 0 ? 0 : (2 * precision * recall) / (precision + recall);\n\n  totalTP += tp; totalFP += fp; totalFN += fn;\n  perDoc.push({\n    doc_id: data.doc_id || \"unknown\",\n    stage: \"after_merge\",\n    tp, fp, fn,\n    precision: +precision.toFixed(4),\n    recall: +recall.toFixed(4),\n    f1: +f1.toFixed(4),\n    true_positives: tpList,\n    false_positives: fpList,\n    false_negatives: fnList\n  });\n}\n\nconst mP = (totalTP + totalFP) === 0 ? 0 : totalTP / (totalTP + totalFP);\nconst mR = (totalTP + totalFN) === 0 ? 0 : totalTP / (totalTP + totalFN);\nconst mF1 = (mP + mR) === 0 ? 0 : (2 * mP * mR) / (mP + mR);\n\nreturn [{ json: {\n  summary: {\n    stage: \"after_merge\",\n    documents: perDoc.length,\n    total_tp: totalTP, total_fp: totalFP, total_fn: totalFN,\n    precision: +mP.toFixed(4), recall: +mR.toFixed(4), f1: +mF1.toFixed(4)\n  },\n  per_document: perDoc\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        928,
+        432
+      ],
+      "id": "8a819ba7-4b4e-418e-9535-17c954e1fe1e",
+      "name": "Evaluation After AI Agent"
+    },
+    {
+      "parameters": {
+        "jsCode": "// NODO DE EVALUACIÓN: Precision / Recall / F1\n// Compara `entities` (detectado) contra `ground_truth.pii` (verdad)\nconst items = $input.all();\nconst results = [];\n\nconst typeFamily = (t) => {\n  t = (t || \"\").toUpperCase();\n  if (t.includes(\"NAME\") || t.includes(\"TITLE\")) return \"NAME\";\n  if (t.includes(\"DATE\") || t.includes(\"BIRTH\")) return \"DATE\";\n  if (t.includes(\"EMAIL\")) return \"EMAIL\";\n  if (t.includes(\"PHONE\")) return \"PHONE\";\n  if (t.includes(\"AGE\")) return \"AGE\";\n  if (t.includes(\"PROFESSION\")) return \"PROFESSION\";\n  return t;\n};\nconst norm = (s) => (s || \"\").trim().toLowerCase().replace(/\\s+/g, \" \");\nconst valueMatch = (a, b) => {\n  a = norm(a); b = norm(b);\n  if (!a || !b) return false;\n  if (a === b) return true;\n  if (a.length >= 3 && b.length >= 3 && (a.includes(b) || b.includes(a))) return true;\n  return false;\n};\n\nlet totalTP = 0, totalFP = 0, totalFN = 0;\nconst perDoc = [];\n\nfor (const item of items) {\n  const data = item.json;\n  const detected = data.entities || [];\n\n  // --- OPTION A: dedupe ground truth by family + normalized value ---\n  const seenTruth = new Set();\n  const truth = ((data.ground_truth && data.ground_truth.pii) || []).filter(t => {\n    const k = typeFamily(t.type) + \"::\" + norm(t.value);\n    if (seenTruth.has(k)) return false;\n    seenTruth.add(k);\n    return true;\n  });\n  // -----------------------------------------------------------------\n\n  const truthUsed = new Array(truth.length).fill(false);\n  let tp = 0;\n  const tpList = [], fpList = [];\n\n  for (const det of detected) {\n    const dFam = typeFamily(det.type);\n    let matchedIdx = -1;\n    for (let i = 0; i < truth.length; i++) {\n      if (truthUsed[i]) continue;\n      if (typeFamily(truth[i].type) === dFam && valueMatch(det.value, truth[i].value)) {\n        matchedIdx = i;\n        break;\n      }\n    }\n    if (matchedIdx >= 0) {\n      truthUsed[matchedIdx] = true;\n      tp++;\n      tpList.push({ detected: det.value, matched: truth[matchedIdx].value, type: dFam });\n    } else {\n      fpList.push({ value: det.value, type: det.type });\n    }\n  }\n\n  const fnList = [];\n  for (let i = 0; i < truth.length; i++) {\n    if (!truthUsed[i]) fnList.push({ value: truth[i].value, type: truth[i].type });\n  }\n\n  const fp = fpList.length;\n  const fn = fnList.length;\n  const precision = (tp + fp) === 0 ? 0 : tp / (tp + fp);\n  const recall = (tp + fn) === 0 ? 0 : tp / (tp + fn);\n  const f1 = (precision + recall) === 0 ? 0 : (2 * precision * recall) / (precision + recall);\n\n  totalTP += tp; totalFP += fp; totalFN += fn;\n  perDoc.push({\n    doc_id: data.doc_id || \"unknown\",\n    tp, fp, fn,\n    precision: +precision.toFixed(4),\n    recall: +recall.toFixed(4),\n    f1: +f1.toFixed(4),\n    true_positives: tpList,\n    false_positives: fpList,\n    false_negatives: fnList\n  });\n}\n\nconst microPrecision = (totalTP + totalFP) === 0 ? 0 : totalTP / (totalTP + totalFP);\nconst microRecall = (totalTP + totalFN) === 0 ? 0 : totalTP / (totalTP + totalFN);\nconst microF1 = (microPrecision + microRecall) === 0 ? 0 : (2 * microPrecision * microRecall) / (microPrecision + microRecall);\n\nreturn [{\n  json: {\n    summary: {\n      documents: perDoc.length,\n      total_tp: totalTP,\n      total_fp: totalFP,\n      total_fn: totalFN,\n      precision: +microPrecision.toFixed(4),\n      recall: +microRecall.toFixed(4),\n      f1: +microF1.toFixed(4)\n    },\n    per_document: perDoc\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        416,
+        432
+      ],
+      "id": "0fd55b9a-cc87-49df-8095-68fbdee27cf0",
+      "name": "Evaluation After Regex"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://gotenberg:3000/forms/chromium/convert/html",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "multipart/form-data"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "index.html",
+              "inputDataFieldName": "index_html"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2128,
+        320
+      ],
+      "id": "3b6c27e9-4628-45c6-95ec-96890c177b9d",
+      "name": "Generate PDF"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Load Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Input": {
+      "main": [
+        [
+          {
+            "node": "A - Detect (regex)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A - Detect (regex)": {
+      "main": [
+        [
+          {
+            "node": "Evaluation After Regex",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Detections": {
+      "main": [
+        [
+          {
+            "node": "Evaluation After AI Agent",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "B - Pseudonymize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "B - Pseudonymize": {
+      "main": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "C - De-pseudonymize": {
+      "main": [
+        [
+          {
+            "node": "D - Evaluate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Merge Detections",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent1": {
+      "main": [
+        [
+          {
+            "node": "C - De-pseudonymize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mistral Cloud Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "D - Evaluate": {
+      "main": [
+        [
+          {
+            "node": "Convert to HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert to HTML": {
+      "main": [
+        [
+          {
+            "node": "Generate PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluation After Regex": {
+      "main": [
+        []
+      ]
+    },
+    "Evaluation After AI Agent": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "fde64585-a5ec-4148-958a-611c712b8b01",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "8966edf07a4a576d0454e1e8464dfcbb208406d46a542bf2a33914d7242b9a65"
+  },
+  "nodeGroups": [],
+  "id": "4I8FleTYlHkc9OdA",
+  "tags": []
+}

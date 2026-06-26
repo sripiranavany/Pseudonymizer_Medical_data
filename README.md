@@ -1,239 +1,124 @@
-# AI Pseudonymizer for Medical Data — System Architecture
+# AI Pseudonymizer for Medical Data
 
-## Overview
-
-The system pseudonymizes German medical documents before sending them to an external LLM for analysis, then restores real names in the output. Patient data never leaves the local environment in identifiable form.
+A privacy-preserving system that pseudonymizes German medical documents before sending them to an external LLM for analysis, then restores real names in the output. Patient data never leaves the local environment in identifiable form.
 
 ---
 
-## Components
+## File Structure
 
-| Container | Role | Port |
-|---|---|---|
-| `ui-frontend` | Angular UI — upload files, view results | 4200 |
-| `ui-backend` | Express.js — API bridge between UI and n8n/doc-processor | 3000 |
-| `n8n` | Workflow orchestration — triggers pipeline, stores results | 5678 |
-| `doc-processor` | FastAPI — text extraction, LangGraph pipeline, DB bridge | 8000 |
-| `ollama` | Local LLM (Mistral 7B) — PII detection only, never external | 11434 |
-| `postgres` | Persistent storage — documents, results, evaluations | 5432 |
-| `pgadmin` | PostgreSQL GUI | 5050 |
+```
+project/
+├── pseudonymization-stage/        # Stage 1 — PII extraction & pseudonymization service
+│   ├── workflows/
+│   │   └── AI Pseudonymizer - Final.json   # n8n workflow definition (import via UI)
+│   ├── Dockerfile                 # Container image for the FastAPI service
+│   ├── docker-compose.yml         # Orchestrates: FastAPI + Ollama + n8n + Gotenberg
+│   ├── main.py                    # FastAPI app — /pseudonymize and /pseudonymize/upload endpoints
+│   ├── pipeline.py                # LangGraph StateGraph — PII extraction, pseudonymization, evaluation
+│   ├── evaluate.py                # Batch evaluation script against test documents
+│   ├── requirements.txt           # Python dependencies
+│   └── test_commands.md           # Example curl commands for manual testing
+│
+├── report/
+│   ├── stage1_pseudonymization_report.md   # Evaluation results and analysis writeup
+│   └── AI_Pseudonymizer_Implementation_EN.pptx  # Presentation slides
+│
+├── demo_video/
+│   ├── BIP_Intelligent_System.mp4
+│   └── full_video.mp4
+│
+├── .bip/                          # Python virtual environment (not committed)
+├── .gitattributes                 # Git LFS tracking for large files
+├── .gitignore
+└── README.md
+```
+
+### Key files explained
+
+| File | Purpose |
+|---|---|
+| `pseudonymization-stage/main.py` | Entry point. Exposes `/pseudonymize` (JSON body) and `/pseudonymize/upload` (file upload). Accepts PDF, DOCX, or TXT. |
+| `pseudonymization-stage/pipeline.py` | Core LangGraph pipeline with nodes: `extract_pii` → `pseudonymize` → `evaluate_detection` → `check_leakage` → `assess_irreversibility`. |
+| `pseudonymization-stage/evaluate.py` | Standalone batch runner. Reads documents from `test_documents/` and their ground truth, prints aggregate Precision / Recall / F1 and saves `eval_results.json`. |
+| `pseudonymization-stage/docker-compose.yml` | Defines four services: `pseudonymization-stage` (FastAPI on 8001), `stage1-ollama` (Mistral 7B on 11435), `stage1-n8n` (workflow UI on 5679), `gotenberg` (PDF rendering). |
+| `pseudonymization-stage/workflows/AI Pseudonymizer - Final.json` | Import this into n8n to get the pre-built workflow. |
 
 ---
 
-## Full Pipeline Flow
+## Project Setup
 
-```
-User (UI / curl)
-      │
-      ▼
-[ui-backend :3000]
-      │
-      ├─ PDF/DOCX/TXT ──► POST /extract ──► [doc-processor :8000]
-      │                                          extracts plain text
-      │
-      ▼
-[n8n Webhook :5678/webhook/pseudonymize]
-      │
-      ▼
-┌─────────────────────────────────────────────────────────────┐
-│  n8n Workflow                                               │
-│                                                             │
-│  Node 1: Normalize Text                                     │
-│    └─ strips whitespace, normalizes input                   │
-│                                                             │
-│  Node 2: LangGraph Pipeline                                 │
-│    └─ POST /langgraph/analyze → [doc-processor :8000]       │
-│                                                             │
-│  Node 9: Format Response                                    │
-│    └─ builds final JSON for the UI                          │
-│                                                             │
-│  ┌── Parallel storage branches ──────────────────────────┐  │
-│  │  0b. Save Document    → POST /db/documents            │  │
-│  │  7b. Store Result     → POST /db/results              │  │
-│  │  8b. Store Evaluation → POST /db/evaluations          │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-      │
-      ▼
-Response → [ui-backend] → [ui-frontend]
-```
+### Prerequisites
+
+- Docker and Docker Compose installed
+- At least 8 GB RAM (Mistral 7B runs on CPU inside Ollama)
+- Python 3.12+ (only needed for running `evaluate.py` locally without Docker)
 
 ---
 
-## LangGraph Pipeline — 6 Nodes
+### Option A — Docker (recommended)
 
-The core logic runs as a `StateGraph` inside `doc-processor/langgraph_pipeline.py`.
-
-```
-original_text
-      │
-      ▼
-[1. extract_pii]
-  Sends text to local Ollama (Mistral 7B)
-  Detects: names, dates, addresses, insurance numbers, physician names
-  Output: list of PII entities + mapping { real → fake }
-      │
-      ▼ (retry once if no PII found)
-[2. pseudonymize]
-  Replaces real values with fake German data
-  Names → random German first+last names
-  Dates → shifted by ±2 years
-  Addresses → fake German street/city
-  Output: pseudonymized_text (safe to send externally)
-      │
-      ▼
-[3. prepare_prompt]
-  Selects prompt template by prompt_type:
-    • clinical_summary   → structured medical summary (7 sections)
-    • diagnosis_support  → differential diagnoses + workup
-    • icd_coding         → ICD-10-GM codes + OPS + DRG hint
-  Inserts pseudonymized_text into {document} placeholder
-      │
-      ▼
-[4. analyze]
-  Sends filled prompt to EXTERNAL_LLM (Mistral API / OpenRouter)
-  Real patient data is NOT present — only pseudonyms
-  Output: raw_llm_output (analysis with fake names)
-      │
-      ▼
-[5. depseudonymize]
-  Replaces fake names back to real names in the LLM output
-  Uses reverse_mapping { fake → real }, longest-first to avoid partial matches
-  Output: restored_analysis (analysis with real names)
-      │
-      ▼
-[6. evaluate]
-  Checks how many PII entities the LLM referenced in its output
-  Calculates: Precision, Recall, F1-score
-  Output: evaluation metrics
-```
-
----
-
-## Privacy Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│              LOCAL ENVIRONMENT                  │
-│                                                 │
-│  Original document (real patient data)          │
-│       │                                         │
-│       ▼                                         │
-│  [Ollama — Mistral 7B on CPU]                   │
-│  PII Detection — stays 100% local               │
-│       │                                         │
-│       ▼                                         │
-│  Pseudonymized document (fake names only)       │
-│       │                                         │
-└───────┼─────────────────────────────────────────┘
-        │  ← only pseudonymized text crosses here
-        ▼
-┌─────────────────────────────────────────────────┐
-│           EXTERNAL LLM (Mistral API)            │
-│  Receives: document with fake names only        │
-│  Returns:  analysis with fake names             │
-└───────┼─────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────┐
-│              LOCAL ENVIRONMENT                  │
-│  De-pseudonymize: restore real names in output  │
-│  Store: results + evaluations in PostgreSQL     │
-└─────────────────────────────────────────────────┘
-```
-
----
-
-## External LLM Configuration
-
-Configured via `n8n/.env` (gitignored — never committed):
-
-```env
-# Currently active: Mistral La Plateforme
-EXTERNAL_LLM_BASE_URL=https://api.mistral.ai/v1
-EXTERNAL_LLM_API_KEY=<your-key>
-EXTERNAL_LLM_MODEL=mistral-small-latest
-```
-
-Switch providers without rebuilding — just update `.env` and run:
-```bash
-docker compose up -d doc-processor
-```
-
-Supported providers:
-- **Mistral API** — EU servers, GDPR-friendly, 500k tokens/month free
-- **OpenRouter** — access to many models, strict free tier rate limits
-- **Local Ollama** — no rate limits, slower on CPU
-
----
-
-## Data Storage (PostgreSQL)
-
-```
-documents
-  id, filename, file_type, raw_text, prompt_type, char_count, created_at
-
-results
-  document_id (FK), pseudonymized_text, raw_llm_output,
-  restored_analysis, mapping (JSON), pii_entity_count, created_at
-
-evaluations
-  document_id (FK), precision_score, recall_score, f1_score,
-  true_positives, false_negatives, residual_fakes,
-  total_pii, appeared_in_llm, details (JSON), created_at
-```
-
----
-
-## Starting the System
+This starts the full Stage 1 stack: FastAPI service, local Ollama LLM, n8n, and Gotenberg.
 
 ```bash
-cd n8n
+cd pseudonymization-stage
 docker compose up -d
 ```
 
-Access points:
-- UI: http://localhost:4200
-- n8n: http://localhost:5678 (admin / admin)
-- pgAdmin: http://localhost:5050
-- doc-processor API: http://localhost:8000/docs
+Wait ~60 seconds for Ollama to pull the Mistral model on first run. Check progress:
+
+```bash
+docker logs stage1-ollama-init -f
+```
+
+**Service endpoints once running:**
+
+| Service | URL | Credentials |
+|---|---|---|
+| FastAPI (pseudonymization API) | <http://localhost:8001/docs> | — |
+| n8n (workflow UI) | <http://localhost:5679> | admin / admin |
+| Ollama | <http://localhost:11435> | — |
+
+**Import the n8n workflow:**
+
+1. Open <http://localhost:5679>
+2. Go to Workflows → Import from file
+3. Select `pseudonymization-stage/workflows/AI Pseudonymizer - Final.json`
 
 ---
 
-## Stage 1 — spaCy Pseudonymization Evaluation (no Docker, no LLM)
+### Option B — Local Python (no Docker)
 
-A standalone stage that runs **only PII extraction + pseudonymization** using spaCy
-and evaluates three things without calling any external LLM:
-
-| Evaluation | What it checks |
-|---|---|
-| PII Detection Quality | Precision / Recall / F1 vs ground truth (TP / FP / FN) |
-| Context Leakage | Did any real PII survive into the pseudonymized output? |
-| Irreversibility Risk | Can an attacker reverse the pseudonymization without the mapping? |
-
-PII definitions and detection rules are configured in `spacy-pseudonymization-stage/gdpr_pii_config.yaml`
-(GDPR article references, regex patterns, context keywords, fake strategies).
-
-### Step 1 — Install and start
+Use the `.bip` virtual environment that is already set up in the project root.
 
 ```bash
-cd spacy-pseudonymization-stage
-pip install -r requirements.txt
-python -m spacy download de_core_news_lg
-uvicorn main:app --port 8002 --reload
+# Activate the environment
+source .bip/bin/activate
+
+# Install dependencies
+pip install -r pseudonymization-stage/requirements.txt
+
+# Start the API
+cd pseudonymization-stage
+uvicorn main:app --port 8001 --reload
 ```
 
-API is now available at `http://localhost:8002`.
-Interactive docs at `http://localhost:8002/docs`.
+API docs available at <http://localhost:8001/docs>.
 
-### Step 2 — Test a single document with ground truth
+> Note: In local mode the service expects Ollama to be running separately on `http://localhost:11434`.
+> Start it with: `ollama serve` and `ollama pull mistral`
+
+---
+
+### Testing
+
+**Single document via curl:**
 
 ```bash
-curl -s -X POST http://localhost:8002/pseudonymize \
+curl -s -X POST http://localhost:8001/pseudonymize \
   -H "Content-Type: application/json" \
   -d '{
     "document_text": "Patient: Hans Müller, Geburtsdatum: 14.03.1958. Versicherungsnummer: A123456789. Arzt: Dr. Sabine Hoffmann.",
-    "document_id": "quick_test",
+    "document_id": "test_01",
     "ground_truth": [
       {"entity": "Hans Müller",        "type": "PERSON_NAME"},
       {"entity": "14.03.1958",          "type": "DATE_OF_BIRTH"},
@@ -243,42 +128,47 @@ curl -s -X POST http://localhost:8002/pseudonymize \
   }' | python3 -m json.tool
 ```
 
-### Step 3 — Batch evaluation against all test documents
+**File upload:**
 
 ```bash
+curl -s -X POST http://localhost:8001/pseudonymize/upload \
+  -F "file=@/path/to/document.pdf" | python3 -m json.tool
+```
+
+**Batch evaluation** (runs all test documents and prints metrics):
+
+```bash
+cd pseudonymization-stage
 python evaluate.py
 ```
 
-Runs all three documents in `test_documents/` against their ground truth files
-in `test_documents/ground_truth/` and prints aggregate metrics:
+---
 
-```
-  PII Detection Quality
-    Precision:           xx%
-    Recall:              xx%
-    F1:                  xx%
+### Stopping the stack
 
-  Detection Layers (total entities by source)
-    regex          18  ████████████████████
-    spacy_ner       9  █████████
-    spacy_ruler     4  ████
-    context_kw      2  ██
-
-  Context Leakage
-    Documents with leak: 0 / 3  (0.0%)
-
-  Irreversibility Risk
-    HIGH  risk entities: x   ← DATE shift is deterministic
-    MEDIUM risk entities: x
-    LOW   risk entities: x
+```bash
+cd pseudonymization-stage
+docker compose down
 ```
 
-Full results are saved to `eval_results.json`.
+To also remove the Ollama model volume (frees ~4 GB):
 
-### Test documents
+```bash
+docker compose down -v
+```
 
-| File | Case | PII covered |
-|---|---|---|
-| `test_doc_01_clinical_de.txt` | Diabetes + gallstones discharge report | Name, DOB, address, insurance ID, phone, email, dates |
-| `test_doc_02_diagnosis_de.txt` | Cardiology referral letter (STEMI) | Two physicians, patient, insurance ID, postal codes, dates |
-| `test_doc_03_icd_coding_de.txt` | Hip replacement ICD coding sheet | Patient ID, three physicians, address, phone, multiple dates |
+---
+
+## Environment Variables
+
+All defaults are set in `docker-compose.yml`. Override them by creating a `.env` file inside `pseudonymization-stage/`:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `OLLAMA_BASE_URL` | `http://stage1-ollama:11434` | Ollama endpoint for PII extraction |
+| `POSTGRES_HOST` | `stage1-postgres` | PostgreSQL host (service disabled by default) |
+| `POSTGRES_DB` | `stage1_db` | Database name |
+| `POSTGRES_USER` | `stage1_user` | Database user |
+| `POSTGRES_PASSWORD` | `stage1_pass` | Database password |
+
+> PostgreSQL is defined in `docker-compose.yml` but commented out — the Stage 1 service runs without a database. Uncomment the `stage1-postgres` service block to enable persistent storage.
