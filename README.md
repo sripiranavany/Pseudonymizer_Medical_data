@@ -197,3 +197,88 @@ Access points:
 - n8n: http://localhost:5678 (admin / admin)
 - pgAdmin: http://localhost:5050
 - doc-processor API: http://localhost:8000/docs
+
+---
+
+## Stage 1 — spaCy Pseudonymization Evaluation (no Docker, no LLM)
+
+A standalone stage that runs **only PII extraction + pseudonymization** using spaCy
+and evaluates three things without calling any external LLM:
+
+| Evaluation | What it checks |
+|---|---|
+| PII Detection Quality | Precision / Recall / F1 vs ground truth (TP / FP / FN) |
+| Context Leakage | Did any real PII survive into the pseudonymized output? |
+| Irreversibility Risk | Can an attacker reverse the pseudonymization without the mapping? |
+
+PII definitions and detection rules are configured in `spacy-pseudonymization-stage/gdpr_pii_config.yaml`
+(GDPR article references, regex patterns, context keywords, fake strategies).
+
+### Step 1 — Install and start
+
+```bash
+cd spacy-pseudonymization-stage
+pip install -r requirements.txt
+python -m spacy download de_core_news_lg
+uvicorn main:app --port 8002 --reload
+```
+
+API is now available at `http://localhost:8002`.
+Interactive docs at `http://localhost:8002/docs`.
+
+### Step 2 — Test a single document with ground truth
+
+```bash
+curl -s -X POST http://localhost:8002/pseudonymize \
+  -H "Content-Type: application/json" \
+  -d '{
+    "document_text": "Patient: Hans Müller, Geburtsdatum: 14.03.1958. Versicherungsnummer: A123456789. Arzt: Dr. Sabine Hoffmann.",
+    "document_id": "quick_test",
+    "ground_truth": [
+      {"entity": "Hans Müller",        "type": "PERSON_NAME"},
+      {"entity": "14.03.1958",          "type": "DATE_OF_BIRTH"},
+      {"entity": "A123456789",          "type": "HEALTH_INSURANCE_ID"},
+      {"entity": "Dr. Sabine Hoffmann", "type": "PERSON_NAME"}
+    ]
+  }' | python3 -m json.tool
+```
+
+### Step 3 — Batch evaluation against all test documents
+
+```bash
+python evaluate.py
+```
+
+Runs all three documents in `test_documents/` against their ground truth files
+in `test_documents/ground_truth/` and prints aggregate metrics:
+
+```
+  PII Detection Quality
+    Precision:           xx%
+    Recall:              xx%
+    F1:                  xx%
+
+  Detection Layers (total entities by source)
+    regex          18  ████████████████████
+    spacy_ner       9  █████████
+    spacy_ruler     4  ████
+    context_kw      2  ██
+
+  Context Leakage
+    Documents with leak: 0 / 3  (0.0%)
+
+  Irreversibility Risk
+    HIGH  risk entities: x   ← DATE shift is deterministic
+    MEDIUM risk entities: x
+    LOW   risk entities: x
+```
+
+Full results are saved to `eval_results.json`.
+
+### Test documents
+
+| File | Case | PII covered |
+|---|---|---|
+| `test_doc_01_clinical_de.txt` | Diabetes + gallstones discharge report | Name, DOB, address, insurance ID, phone, email, dates |
+| `test_doc_02_diagnosis_de.txt` | Cardiology referral letter (STEMI) | Two physicians, patient, insurance ID, postal codes, dates |
+| `test_doc_03_icd_coding_de.txt` | Hip replacement ICD coding sheet | Patient ID, three physicians, address, phone, multiple dates |

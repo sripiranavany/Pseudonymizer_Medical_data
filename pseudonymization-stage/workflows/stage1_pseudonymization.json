@@ -1,0 +1,102 @@
+{
+  "name": "Stage 1 - Pseudonymization Evaluation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stage1-pseudonymize",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "s1-webhook",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "stage1-pseudonymizer-v1"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\n\nconst documentText = body.document_text || '';\nconst documentId   = body.document_id  || 'doc_' + Date.now();\nconst groundTruth  = body.ground_truth || null;\n\nif (!documentText.trim()) {\n  throw new Error('document_text is required and must not be empty');\n}\n\n// Normalise line endings\nconst normalizedText = documentText\n  .split('\\r\\n').join('\\n')\n  .split('\\r').join('\\n')\n  .trim();\n\n// PII lives in the header — cap at 3 000 chars so Ollama stays fast\nconst piiSection = normalizedText.slice(0, 3000);\n\nconst stage1Body = JSON.stringify({\n  document_id:   documentId,\n  document_text: normalizedText,\n  pii_section:   piiSection,\n  ground_truth:  groundTruth\n});\n\nreturn [{\n  json: {\n    document_id:  documentId,\n    text:         normalizedText,\n    char_count:   normalizedText.length,\n    ground_truth: groundTruth,\n    stage1_body:  stage1Body\n  }\n}];\n"
+      },
+      "id": "s1-normalize",
+      "name": "1. Normalize & Prepare",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pseudonymization-stage:8001/pseudonymize",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.stage1_body }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "s1-pipeline",
+      "name": "2. Stage 1 Pipeline",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 0],
+      "onError": "stopWorkflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\n\nconst det  = input.pii_detection_eval || {};\nconst leak = input.context_leakage    || {};\nconst rev  = input.irreversibility    || {};\n\n// ── Detection verdict ──────────────────────────────────────────────\nconst detVerdict = (det.precision != null)\n  ? (det.recall >= 90 && det.precision >= 90\n      ? 'GOOD'\n      : det.recall >= 70\n        ? 'ACCEPTABLE'\n        : 'POOR')\n  : 'NO_GROUND_TRUTH';\n\nconst report = {\n  document_id:          input.document_id,\n  status:               'stage1_complete',\n  external_llm_called:  false,\n\n  // ── Raw pipeline output ──────────────────────────────────────────\n  pii_entities_detected: (input.pii_entities || []).length,\n  pii_entities:          input.pii_entities  || [],\n  mapping_size:          Object.keys(input.mapping || {}).length,\n  pseudonymized_text:    input.pseudonymized_text || '',\n\n  // ── A: PII Detection Quality ─────────────────────────────────────\n  pii_detection: {\n    verdict:            detVerdict,\n    ground_truth_count: det.ground_truth_count  ?? null,\n    detected_count:     det.detected_count       ?? 0,\n    true_positives:     det.true_positives       ?? null,\n    false_positives:    det.false_positives      ?? null,\n    false_negatives:    det.false_negatives      ?? null,\n    precision_pct:      det.precision            ?? null,\n    recall_pct:         det.recall               ?? null,\n    f1_score_pct:       det.f1_score             ?? null,\n    fp_entities:        det.fp_entities          || [],\n    fn_entities:        det.fn_entities          || [],\n    note:               det.note                 || null\n  },\n\n  // ── B: Context Leakage ───────────────────────────────────────────\n  context_leakage: {\n    verdict:         leak.verdict         || 'UNKNOWN',\n    leakage_free:    leak.leakage_free    ?? null,\n    leaked_count:    leak.leaked_count    ?? 0,\n    leaked_entities: leak.leaked_entities || [],\n    note:            leak.note            || null\n  },\n\n  // ── C: Irreversibility ───────────────────────────────────────────\n  irreversibility: {\n    verdict:              rev.verdict              || 'UNKNOWN',\n    high_risk_count:      rev.high_risk_count      ?? 0,\n    medium_risk_count:    rev.medium_risk_count    ?? 0,\n    low_risk_count:       rev.low_risk_count       ?? 0,\n    high_risk_entities:   rev.high_risk_entities   || [],\n    medium_risk_entities: rev.medium_risk_entities || [],\n    risks:                rev.risks                || [],\n    note:                 rev.note                 || null\n  },\n\n  // ── Privacy summary ───────────────────────────────────────────────\n  privacy_summary: {\n    pii_sent_to_external_llm:  false,\n    real_pii_in_pseudonymized: !(leak.leakage_free),\n    reversibility_verdict:     rev.verdict  || 'UNKNOWN',\n    detection_verdict:         detVerdict\n  }\n};\n\nreturn [{ json: report }];\n"
+      },
+      "id": "s1-format",
+      "name": "3. Format Evaluation Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [780, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "s1-respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1060, 0]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [{ "node": "1. Normalize & Prepare", "type": "main", "index": 0 }]
+      ]
+    },
+    "1. Normalize & Prepare": {
+      "main": [
+        [{ "node": "2. Stage 1 Pipeline", "type": "main", "index": 0 }]
+      ]
+    },
+    "2. Stage 1 Pipeline": {
+      "main": [
+        [{ "node": "3. Format Evaluation Report", "type": "main", "index": 0 }]
+      ]
+    },
+    "3. Format Evaluation Report": {
+      "main": [
+        [{ "node": "Respond to Webhook", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {}
+}

@@ -1,0 +1,126 @@
+services:
+
+  # ── Stage 1: PII Extraction + Pseudonymization ─────────────────────
+  # FastAPI service — runs the LangGraph pipeline (nodes 1-2) and the
+  # three-part evaluation (PII detection quality, context leakage,
+  # irreversibility risk). No external LLM is ever called.
+  pseudonymization-stage:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pseudonymization-stage
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - OLLAMA_BASE_URL=http://stage1-ollama:11434
+      # - POSTGRES_HOST=stage1-postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=stage1_db
+      - POSTGRES_USER=stage1_user
+      - POSTGRES_PASSWORD=stage1_pass
+    depends_on:
+      - stage1-ollama
+      # - stage1-postgres
+    networks:
+      - stage1_net
+
+  # ── n8n Workflow Orchestration ─────────────────────────────────────
+  # Exposed on 5679 to avoid conflict with the main stack on 5678.
+  # Import the workflow from workflows/stage1_pseudonymization.json
+  # via the n8n UI (Workflows → Import from file).
+  stage1-n8n:
+    image: n8nio/n8n:latest
+    container_name: stage1-n8n
+    restart: unless-stopped
+    ports:
+      - "5679:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=admin
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:5679/
+      - GENERIC_TIMEZONE=Europe/Berlin
+      - TZ=Europe/Berlin
+      - NODE_FUNCTION_ALLOW_BUILTIN=*
+      - NODE_FUNCTION_ALLOW_EXTERNAL=*
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - N8N_TEMPLATES_ENABLED=false
+    volumes:
+      - stage1_n8n_data:/home/node/.n8n
+      - ./workflows:/workflows:ro
+    depends_on:
+      - pseudonymization-stage
+      - gotenberg
+    networks:
+      - stage1_net
+
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    container_name: stage1-gotenberg
+    restart: unless-stopped
+    networks:
+      - stage1_net
+
+  # ── Local LLM (PII extraction only) ───────────────────────────────
+  # Exposed on 11435 to avoid conflict with the main stack on 11434.
+  stage1-ollama:
+    image: ollama/ollama:latest
+    container_name: stage1-ollama
+    restart: unless-stopped
+    ports:
+      - "11435:11434"
+    volumes:
+      - stage1_ollama_data:/root/.ollama
+    networks:
+      - stage1_net
+
+  stage1-ollama-init:
+    image: ollama/ollama:latest
+    container_name: stage1-ollama-init
+    depends_on:
+      - stage1-ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sleep 10
+        ollama pull mistral
+    environment:
+      - OLLAMA_HOST=stage1-ollama:11434
+    networks:
+      - stage1_net
+    restart: "no"
+
+  # ── PostgreSQL (health-check only in Stage 1 — no results stored) ──
+  # Exposed on 5433 to avoid conflict with the main stack on 5432.
+  # stage1-postgres:
+  #   image: postgres:15-alpine
+  #   container_name: stage1-postgres
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5433:5432"
+  #   environment:
+  #     - POSTGRES_DB=stage1_db
+  #     - POSTGRES_USER=stage1_user
+  #     - POSTGRES_PASSWORD=stage1_pass
+  #   volumes:
+  #     - stage1_postgres_data:/var/lib/postgresql/data
+  #   networks:
+  #     - stage1_net
+
+volumes:
+  stage1_n8n_data:
+    driver: local
+  stage1_ollama_data:
+    driver: local
+  stage1_postgres_data:
+    driver: local
+
+networks:
+  stage1_net:
+    driver: bridge

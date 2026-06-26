@@ -2,6 +2,8 @@
 n8n/.env
 n8n/pgpass
 
+.bip/*
+
 # Node.js
 node_modules/
 npm-debug.log*
