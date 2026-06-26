@@ -1,5 +1,12 @@
 # AI Pseudonymizer for Medical Data
 
+> **Erasmus+ BIP Programme — Group F**
+>
+> | | |
+> | --- | --- |
+> | Sripiranavan Yogarajah | Priyneiyah Selvakumar |
+> | Rostislav Rusev Lebedovych | David Baiasu |
+
 A privacy-preserving system that pseudonymizes German medical documents before sending them to an external LLM for analysis, then restores real names in the output. Patient data never leaves the local environment in identifiable form.
 
 ---
